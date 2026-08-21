@@ -485,6 +485,9 @@ class PortFwdApp(App):
         self._auth_prompted: dict[str, bool] = {}
         # 左侧列表最后写入的文案（避免无谓刷新）
         self._conn_marks: dict[str, str] = {}
+        # ListItem id -> 连接名（连接名可能以数字开头/含点号，
+        # 不能直接用作 Textual 的 CSS 标识符，见 BadIdentifier）
+        self._item_conn: dict[str, str] = {}
         self._load_forwards()
 
     # -- 初始化 --------------------------------------------------------------
@@ -547,11 +550,14 @@ class PortFwdApp(App):
         await lv.clear()
         self._conn_marks.clear()
         items: list[ListItem] = []
-        for conn in self._config.connections:
+        self._item_conn.clear()
+        for idx, conn in enumerate(self._config.connections):
+            item_id = f"conn-item-{idx}"
+            self._item_conn[item_id] = conn.name
             mark = "●" if self._conn_up(conn.name) else "○"
             text = f"{mark} {conn.name}"
             self._conn_marks[conn.name] = text
-            items.append(ListItem(Label(text), id=conn.name))
+            items.append(ListItem(Label(text), id=item_id))
         if items:
             await lv.extend(items)
         target: Optional[int] = None
@@ -611,7 +617,10 @@ class PortFwdApp(App):
         for item in list(lv.children):
             if not isinstance(item, ListItem) or item.id is None:
                 continue
-            conn = self._config.find(item.id)
+            name = self._item_conn.get(item.id)
+            if name is None:
+                continue
+            conn = self._config.find(name)
             if conn is None:
                 continue
             mark = "●" if self._conn_up(conn.name) else "○"
@@ -838,13 +847,20 @@ class PortFwdApp(App):
         self.notify(f"发现 {len(rows)} 个远程监听端口", severity="information")
 
     # -- 选择事件 -----------------------------------------------------------------
+    def _conn_name_of_item(self, item: ListItem | None) -> str | None:
+        if item is None or item.id is None:
+            return None
+        return self._item_conn.get(item.id)
+
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.item is not None and event.item.id:
-            self._selected_conn = event.item.id
+        name = self._conn_name_of_item(event.item)
+        if name:
+            self._selected_conn = name
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is not None and event.item.id:
-            self._selected_conn = event.item.id
+        name = self._conn_name_of_item(event.item)
+        if name:
+            self._selected_conn = name
             self._post_async(self.action_conn_toggle)
 
     def _fwd_id_at_row(self, row: int) -> Optional[str]:

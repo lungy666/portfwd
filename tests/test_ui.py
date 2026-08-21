@@ -328,3 +328,41 @@ async def _reverse_flow_tui() -> None:
 
 def test_ui_reverse():
     asyncio.run(_reverse_flow_tui())
+
+
+# ---------------------------------------------------------------------------
+# 回归：连接名以数字开头/含点号时不能作为 Textual widget id（BadIdentifier）
+# ---------------------------------------------------------------------------
+async def _numeric_conn_name_tui() -> None:
+    tmp = tempfile.mkdtemp(prefix="portfwd-ui-num-")
+    os.environ["PORTFWD_HOME"] = tmp
+    os.environ["PORTFWD_DISABLE_KEYCHAIN"] = "1"
+
+    from textual.widgets import ListItem, ListView
+
+    from portfwd.app import PortFwdApp
+    from portfwd.config import ConnectionDef
+
+    app = PortFwdApp()
+    # 挂载前预置：on_mount -> _render_connections 即真实崩溃路径
+    app._config.add(ConnectionDef(name="3090", host="127.0.0.1"))
+    app._config.add(ConnectionDef(name="10.0.0.5", host="127.0.0.1"))
+
+    async with app.run_test(size=(100, 28)) as pilot:
+        await pilot.pause()
+        lv = app.query_one("#conn-list", ListView)
+        items = [w for w in lv.children if isinstance(w, ListItem)]
+        assert len(items) == 2, f"应有 2 个条目，实际 {len(items)}"
+        app._refresh_conn_marks()
+        assert app._conn_marks.get("3090") == "○ 3090", app._conn_marks
+        # 选择事件应正确映射回连接名
+        app.on_list_view_highlighted(ListView.Highlighted(lv, items[0]))
+        assert app._selected_conn == "3090", app._selected_conn
+        app.on_list_view_highlighted(ListView.Highlighted(lv, items[1]))
+        assert app._selected_conn == "10.0.0.5", app._selected_conn
+
+    print("TUI NUMERIC NAME TEST PASSED ✓")
+
+
+def test_ui_numeric_name():
+    asyncio.run(_numeric_conn_name_tui())
