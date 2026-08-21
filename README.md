@@ -21,6 +21,16 @@ HTTP/SOCKS 代理出网）。
 - **认证**：自动（agent/默认密钥 → 失败弹密码框）/ 仅密钥 / 密码（可保存到配置）
 - **主机密钥**：`accept-new` 策略（首次自动记录到 known_hosts，密钥不匹配则拒绝）
 
+## 界面预览
+
+### GUI
+
+![portfwd GUI 界面](assets/screenshots/gui.png)
+
+### TUI
+
+![portfwd TUI 界面](assets/screenshots/tui.png)
+
 ## 安装
 
 ```bash
