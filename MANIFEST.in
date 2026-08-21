@@ -1,0 +1,3 @@
+include README.md main.py
+recursive-include assets *
+include scripts/build_macos.sh

@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portfwd"
+version = "0.1.0"
+description = "SSH 端口转发管理工具（VS Code Remote-SSH PORTS 面板风格，TUI + GUI）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "paramiko>=3.0,<5",
+    "textual>=0.50,<9",
+    "rich>=13.0,<16",
+    "flet>=0.86,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.6,<1",
+]
+build = [
+    "flet-cli==0.86.5",
+]
+
+[project.scripts]
+portfwd = "portfwd.__main__:main"
+portfwd-gui = "portfwd.__main__:gui_main"
+
+[tool.setuptools]
+packages = ["portfwd"]
+
+[tool.flet]
+product = "portfwd"
+artifact = "portfwd"
+org = "com.portfwd"
+bundle_id = "com.portfwd.desktop"
+company = "portfwd"
+copyright = "Copyright 2026 portfwd"
+build_number = 1
+
+[tool.flet.app]
+module = "main.py"
+exclude = [".git", ".venv", "build", "dist", "tests"]
+
+[tool.flet.flutter.pubspec.dependency_overrides]
+# connectivity_plus >= 7.1 references macOS 26 APIs unavailable in Xcode 16.4.
+connectivity_plus = "7.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = [".venv", "build", "dist"]
