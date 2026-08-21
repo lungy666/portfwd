@@ -5,6 +5,7 @@
 """
 import asyncio
 import os
+import queue
 import tempfile
 import threading
 import uuid
@@ -66,15 +67,22 @@ class FakePage:
 
 
 class FakeSession:
-    """鸭子类型的 Session：只提供 SessionManager.drop / _tick_once 用到的接口。"""
+    """鸭子类型的 Session：提供 SessionManager.drop / _tick_once /
+    worker 方向分派用到的接口，并记录 open/close 调用。"""
 
-    def __init__(self, name: str, fwd_ids=(), traffic=(0, 0), up: bool = True) -> None:
+    def __init__(self, name: str, fwd_ids=(), traffic=(0, 0), up: bool = True,
+                 events=None) -> None:
         self.name = name
         self.client = None
         self._closed_evt = threading.Event()
         self._fwd_ids = set(fwd_ids)
         self._traffic = traffic
         self._up = up
+        self._events = events
+        self.opened: list[tuple] = []
+        self.opened_rev: list[tuple] = []
+        self.closed: list[str] = []
+        self.close_calls = 0
 
     @property
     def connected(self) -> bool:
@@ -82,6 +90,36 @@ class FakeSession:
 
     def _teardown_forwards(self) -> None:
         pass
+
+    def _emit_active(self, fwd_id: str) -> None:
+        if self._events is not None:
+            try:
+                self._events.put_nowait(
+                    {"type": "fwd_active", "conn": self.name, "fwd_id": fwd_id})
+            except queue.Full:
+                pass
+
+    def open_forward_blocking(self, fwd_id, local_port, remote_host,
+                              remote_port, bind_ip="127.0.0.1"):
+        self.opened.append((fwd_id, local_port, remote_host, remote_port))
+        self._fwd_ids.add(fwd_id)
+        self._emit_active(fwd_id)
+
+    def open_reverse_forward_blocking(self, fwd_id, remote_host,
+                                      remote_port, local_host, local_port):
+        self.opened_rev.append((fwd_id, remote_host, remote_port,
+                                local_host, local_port))
+        self._fwd_ids.add(fwd_id)
+        self._emit_active(fwd_id)
+
+    def close_forward_blocking(self, fwd_id):
+        self.closed.append(fwd_id)
+        self._fwd_ids.discard(fwd_id)
+
+    def close_blocking(self):
+        self.close_calls += 1
+        self._up = False
+        self._fwd_ids.clear()
 
     def running_forwards(self) -> set:
         return set(self._fwd_ids)
@@ -237,3 +275,106 @@ if __name__ == "__main__":
 
 def test_gui_smoke():
     main()
+
+
+# ---------------------------------------------------------------------------
+# 反向转发：对话框方向切换 / 保存链路 / 方向分派 / 不显示浏览器打开
+# ---------------------------------------------------------------------------
+def _gui_reverse_flow() -> None:
+    tmp = tempfile.mkdtemp(prefix="portfwd-gui-rev-")
+    os.environ["PORTFWD_HOME"] = tmp
+    os.environ["PORTFWD_DISABLE_KEYCHAIN"] = "1"
+
+    from portfwd.config import ConnectionDef
+    from portfwd.gui import PortFwdGui
+    from portfwd.models import FwdDirection, FwdStatus, PortForward
+
+    page = FakePage()
+    gui = PortFwdGui()
+    gui.attach(page)
+    conn = ConnectionDef(name="fake", host="127.0.0.1", user="tester")
+    gui._config.add(conn)
+    gui._selected_conn = "fake"
+
+    fake = FakeSession("fake", events=gui._manager.events)
+    fake.client = object()  # worker 检查该属性判断客户端已建立
+    gui._manager.sessions["fake"] = fake
+
+    # 新转发对话框：方向默认正向，与旧版一致
+    gui._fwd_new()
+    dlg = page.dialogs[-1]
+    controls = dlg.content.content.controls
+    f_name, f_dir = controls[0], controls[1]
+    f_local, f_rport = controls[2].controls[0], controls[2].controls[1]
+    f_lhost, f_rhost = controls[3], controls[4]
+    assert f_dir.value == "forward"
+    assert f_lhost.visible is False, "正向不显示本机目标地址字段"
+    assert f_rhost.disabled is False
+
+    # 切到反向：字段标签/默认值/可见性随之变化
+    f_dir.value = "reverse"
+    f_dir.on_change(None)
+    assert f_lhost.visible is True, "反向应显示本机目标地址字段"
+    assert f_rhost.disabled is True and f_rhost.value == "127.0.0.1", \
+        "反向远程监听地址应锁定 127.0.0.1"
+    assert f_local.label == "本机目标端口" and f_local.value == "", \
+        "切到反向后本机目标端口应由用户填写"
+    assert f_rport.value == "18080", "反向应给出非默认的建议监听端口"
+
+    # 保存反向规则：走全链路（config + 渲染 + worker 分派）
+    f_name.value = "proxy"
+    f_local.value = "7890"
+    f_rport.value = "17890"
+    dlg.actions[1].on_click(None)  # 保存并启动
+    assert dlg not in page.dialogs, "保存成功后应关闭对话框"
+
+    saved = [f for f in gui._forwards.values() if f.name == "proxy"]
+    assert saved, "反向规则应已保存"
+    saved = saved[0]
+    assert saved.direction is FwdDirection.REVERSE
+    assert (saved.local_host, saved.local_port) == ("127.0.0.1", 7890)
+    assert (saved.remote_host, saved.remote_port) == ("127.0.0.1", 17890)
+    assert any(d.get("id") == saved.id and d.get("direction") == "reverse"
+               and d.get("local_host") == "127.0.0.1"
+               for d in conn.port_forwards), "方向应持久化进配置"
+    # 连接已启动 -> worker 按 direction 分派到 open_reverse_forward_blocking
+    assert (saved.id, "127.0.0.1", 17890, "127.0.0.1", 7890) in fake.opened_rev, \
+        fake.opened_rev
+
+    # 事件流：fwd_active -> 行内状态刷新（与正向一致）
+    gui._handle_event({"type": "fwd_active", "conn": "fake", "fwd_id": saved.id})
+    assert saved.status == FwdStatus.ACTIVE
+
+    # 反向行不显示"浏览器打开"按钮；正向行显示
+    def open_icons(row) -> list:
+        return [c.icon for c in row.controls if isinstance(c, ft.IconButton)
+                and c.icon == ft.Icons.OPEN_IN_NEW]
+
+    assert not open_icons(gui._actions_row(saved)), \
+        "反向规则不能打开浏览器"
+    gui._fwd_open(saved.id)  # 反向直接调用也应安全忽略
+
+    fwd_f = PortForward(
+        id=uuid.uuid4().hex[:8], name="web", local_port=8080,
+        remote_host="127.0.0.1", remote_port=3000, conn="fake")
+    fwd_f.status = FwdStatus.ACTIVE
+    gui._forwards[fwd_f.id] = fwd_f
+    assert open_icons(gui._actions_row(fwd_f)), "正向规则应保留浏览器打开按钮"
+
+    # 冲突语义：反向不占本机监听端口；同连接内重复远程监听被拒
+    assert gui._local_port_taken(7890) is False
+    assert gui._rev_bind_taken("fake", "127.0.0.1", 17890) is True
+    assert gui._rev_bind_taken("other", "127.0.0.1", 17890) is False
+
+    # 表格渲染：方向列显示"服务器访问本机"
+    gui._rebuild_forwards()
+    rows = gui._fwd_table.rows
+    assert len(rows) == 2
+    cells = rows[0].cells
+    assert cells[2].content.value == "服务器访问本机"
+
+    print("GUI REVERSE FLOW TEST PASSED ✓")
+
+
+def test_gui_reverse():
+    _gui_reverse_flow()

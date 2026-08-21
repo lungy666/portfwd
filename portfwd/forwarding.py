@@ -1,13 +1,21 @@
 """SSH 连接与端口转发引擎。
 
-对齐 VS Code Remote-SSH 的 PORTS 面板语义：
-  在本机 127.0.0.1:<local_port> 起监听；每来一个本地连接，
-  就打开一条 direct-tcpip SSH channel 连到远程 <remote_host>:<remote_port>，
-  双向泵送数据。于是浏览器访问本地端口即可打开远程服务。
+对齐 VS Code Remote-SSH 的 PORTS 面板语义，支持两个方向：
+  正向（forward）：在本机 127.0.0.1:<local_port> 起监听；每来一个本地
+    连接，就打开一条 direct-tcpip SSH channel 连到远程
+    <remote_host>:<remote_port>，双向泵送数据。浏览器访问本地端口即可
+    打开远程服务。
+  反向（reverse）：请服务器在 127.0.0.1:<remote_port> 起监听
+    （tcpip-forward 全局请求）；每来一个转发连接（forwarded-tcpip
+    channel），就在本机 socket 连到 <local_host>:<local_port>，双向泵送。
+    典型用途：服务器经本机代理（127.0.0.1:7890）出网。反向监听端仅
+    允许 loopback，绝不暴露 0.0.0.0。
 
 线程模型（重要）：
   - 本模块所有 *_blocking 方法都会阻塞（socket / SSH I/O），
     调用方必须在 worker 线程里调用，绝不能在 Textual UI 线程里同步调用。
+  - 反向转发的 handler 由 paramiko 在 Transport 线程回调，只能做路由
+    判断并立即起 daemon 线程，绝不能在里面阻塞（如连接本机）。
   - 引擎线程通过共享的 events 队列（queue.Queue）向 UI 推送状态变化；
     流量/连接数则由 UI 定时轮询 traffic() 获取，避免队列被高频打爆。
 """
@@ -27,7 +35,7 @@ import paramiko
 from paramiko import SSHClient
 
 from .config import ConnectionDef, load_pkey, ssh_config_fill
-from .models import FwdStatus, PortForward
+from .models import FwdDirection, FwdStatus, PortForward
 
 log = logging.getLogger("portfwd")
 
@@ -147,9 +155,14 @@ class _Forward:
     """一条运行期转发的状态（不持久化）。"""
 
     def __init__(self) -> None:
+        self.fwd_id = ""
         self.stop_evt = threading.Event()
         self.meter = _TrafficMeter()
         self.listener: Optional[socket.socket] = None
+        # 反向转发：远端 bind 信息（请求成功才登记）与本机目标 host:port
+        self.reverse = False
+        self.rev_bind: tuple[str, int] = ("", 0)
+        self.local_target: tuple[str, int] = ("127.0.0.1", 0)
         self.seq = 0
         self.seq_lock = threading.Lock()
         self.pumps: set[Any] = set()  # 活跃 pump 的 channel，关闭转发时统一关闭
@@ -172,6 +185,9 @@ class Session:
                                         conn.identity_file)
         self._forwards: dict[str, _Forward] = {}
         self._fwd_lock = threading.Lock()
+        # Paramiko stores one forwarded-tcpip handler per Transport. Serialize
+        # remote listen requests/cancellations so one rule cannot clear another.
+        self._reverse_request_lock = threading.Lock()
         self._state = FwdStatus.STOPPED  # 连接级状态
         self._hb: Optional[threading.Thread] = None
         self._closed_evt = threading.Event()
@@ -369,10 +385,124 @@ class Session:
                 name=f"portfwd-pump-{cid}",
             ).start()
 
+    def open_reverse_forward_blocking(self, fwd_id: str, remote_host: str,
+                                      remote_port: int, local_host: str,
+                                      local_port: int) -> None:
+        """阻塞请求服务器端 loopback 监听（tcpip-forward），成功才登记转发。
+
+        paramiko 的 forwarded-tcpip handler 是 Transport 级单槽位，所以
+        这里注册的是 Session 级路由 handler（_remote_forward_handler），
+        由它按服务器回报的监听 (host, port) 找到对应规则。
+        """
+        tr = self._transport()
+        if tr is None:
+            raise RuntimeError("SSH 未连接")
+        bind_host = "127.0.0.1" if str(remote_host).strip().lower() == "localhost" \
+            else str(remote_host).strip()
+        if bind_host != "127.0.0.1":
+            raise RuntimeError(
+                f"反向转发的远程监听地址仅支持 127.0.0.1/localhost，收到：{remote_host!r}"
+            )
+        local_host = str(local_host).strip() or "127.0.0.1"
+        remote_port = int(remote_port)
+        f = _Forward()
+        f.fwd_id = fwd_id
+        f.reverse = True
+        f.rev_bind = (bind_host, remote_port)
+        f.local_target = (local_host, int(local_port))
+        with self._reverse_request_lock:
+            with self._fwd_lock:
+                if fwd_id in self._forwards:
+                    raise RuntimeError("该转发已在运行")
+                if any(
+                    cand.reverse and cand.rev_bind == f.rev_bind
+                    for cand in self._forwards.values()
+                ):
+                    raise RuntimeError(
+                        f"远程监听 {bind_host}:{remote_port} 已被该连接的其它反向转发占用"
+                    )
+                self._forwards[fwd_id] = f
+            try:
+                tr.request_port_forward(bind_host, remote_port,
+                                        self._remote_forward_handler)
+            except Exception as e:
+                # 启动失败必须原子回滚，_forwards 不留残留
+                with self._fwd_lock:
+                    self._forwards.pop(fwd_id, None)
+                if isinstance(e, paramiko.SSHException) and "denied" in str(e).lower():
+                    raise RuntimeError(
+                        f"服务器拒绝了远程端口转发（remote forwarding）"
+                        f" {bind_host}:{remote_port}：请确认 sshd 允许 "
+                        f"AllowTcpForwarding，且该远程端口未被其它服务占用"
+                    ) from e
+                raise RuntimeError(
+                    f"远程监听启动失败 {bind_host}:{remote_port}：{e}"
+                ) from e
+        self._push(type="fwd_active", fwd_id=fwd_id)
+        log.info("反向转发 %s 已激活 %s:%s -> %s:%s", fwd_id, bind_host,
+                 remote_port, local_host, local_port)
+
+    def _remote_forward_handler(self, channel: Any, origin: Any, dest: Any) -> None:
+        """Transport 线程回调：只做路由判断并派线程，绝不阻塞。"""
+        try:
+            addr, port = str(dest[0]), int(dest[1])
+        except (TypeError, ValueError, IndexError):
+            _close(channel)
+            return
+        if addr == "localhost":
+            addr = "127.0.0.1"
+        f: _Forward | None = None
+        with self._fwd_lock:
+            for cand in self._forwards.values():
+                if cand.reverse and cand.rev_bind == (addr, port):
+                    f = cand
+                    break
+        # 停止竞态：规则已删除/已停止时，新到的 channel 立即关闭
+        if f is None or f.stop_evt.is_set():
+            _close(channel)
+            return
+        threading.Thread(
+            target=self._handle_remote_channel,
+            args=(f.fwd_id, channel, f),
+            daemon=True,
+            name=f"portfwd-rev-{f.fwd_id}",
+        ).start()
+
+    def _handle_remote_channel(self, fwd_id: str, channel: Any, f: _Forward) -> None:
+        """独立线程：连本机目标，复用 _pump / 流量计数 / 统一关闭逻辑。"""
+        host, port = f.local_target
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except OSError as e:
+            # 本机目标暂不可达：关掉本条 channel，但监听规则保持 active
+            log.warning("反向转发 %s 连接本机目标 %s:%s 失败（保持监听）: %s",
+                        fwd_id, host, port, e)
+            _close(channel)
+            return
+        # The timeout only bounds connection establishment. Proxy/tunnel
+        # sessions may legitimately stay idle for much longer than five seconds.
+        sock.settimeout(None)
+        if f.stop_evt.is_set():
+            _close(sock)
+            _close(channel)
+            return
+        with f.seq_lock:
+            f.seq += 1
+            cid = f"{fwd_id}#{f.seq}"
+        f.meter.start(cid)
+        self._pump(sock, channel, f.meter, cid, f)
+
     def _pump(self, sock: socket.socket, channel: Any, meter: _TrafficMeter,
-              cid: str, f: "_Forward") -> None:
+        cid: str, f: "_Forward") -> None:
         f_pumps = (f.pumps, f.pumps_lock)
         with f.pumps_lock:
+            # close_forward_blocking may win the race between spawning this
+            # worker and registering its resources. Never register after stop.
+            if f.stop_evt.is_set():
+                _close(channel)
+                _close(sock)
+                meter.end(cid)
+                return
             f.pumps.add(channel)
             f.sockets.add(sock)
 
@@ -411,12 +541,32 @@ class Session:
                 f.sockets.discard(sock)
 
     def close_forward_blocking(self, fwd_id: str) -> None:
-        with self._fwd_lock:
-            f = self._forwards.pop(fwd_id, None)
+        with self._reverse_request_lock:
+            with self._fwd_lock:
+                f = self._forwards.pop(fwd_id, None)
+                reverse_remains = any(
+                    cand.reverse for cand in self._forwards.values()
+                )
+            if f is not None and f.reverse:
+                # Paramiko cancel_port_forward() clears the Transport-wide
+                # handler. Preserve it while other reverse rules still exist.
+                tr = self._transport()
+                if tr is not None:
+                    try:
+                        if reverse_remains:
+                            tr.global_request(
+                                "cancel-tcpip-forward", f.rev_bind, wait=True
+                            )
+                        else:
+                            tr.cancel_port_forward(*f.rev_bind)
+                    except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                        log.warning("取消远程监听 %s:%s 失败: %s",
+                                    *f.rev_bind, e)
         if f is None:
             return
         f.stop_evt.set()
-        _close(f.listener)
+        if not f.reverse:
+            _close(f.listener)
         # 同时关闭远端 channel 和本地 socket，确保双向 pump 不会长期阻塞。
         with f.pumps_lock:
             channels = list(f.pumps)
@@ -505,6 +655,23 @@ class Session:
                 pass
             self.client = None
         self._state = FwdStatus.STOPPED
+
+
+def open_forward_for_session(session: Session, fwd: PortForward) -> None:
+    """按 direction 分派到引擎的正/反向启动接口（worker 线程调用，阻塞）。
+
+    正向：本机监听 -> SSH -> 远程目标；
+    反向：远程 loopback 监听 -> SSH -> 本机目标。
+    """
+    if fwd.direction is FwdDirection.REVERSE:
+        session.open_reverse_forward_blocking(
+            fwd.id, fwd.remote_host, fwd.remote_port,
+            fwd.local_host, fwd.local_port,
+        )
+    else:
+        session.open_forward_blocking(
+            fwd.id, fwd.local_port, fwd.remote_host, fwd.remote_port
+        )
 
 
 def _close(obj: Any) -> None:

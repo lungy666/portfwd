@@ -23,9 +23,11 @@ class FakeSession:
         # 非 None 表示 paramiko 客户端已建立（app worker 会检查该属性）
         self.client = object()
         self.opened: list[tuple[str, int, str, int]] = []
+        self.opened_rev: list[tuple[str, str, int, str, int]] = []
         self.closed: list[str] = []
         self.close_calls = 0
         self._listeners = {}
+        self._rev_active: set[str] = set()
         import socket
         self._socket_mod = socket
 
@@ -33,7 +35,15 @@ class FakeSession:
     def connected(self):
         return self.connected_now
 
-    def open_forward_blocking(self, fwd_id, local_port, remote_host, remote_port):
+    def _emit_active(self, fwd_id: str) -> None:
+        try:
+            self.events.put_nowait(
+                {"type": "fwd_active", "conn": "fake", "fwd_id": fwd_id})
+        except Exception:
+            pass
+
+    def open_forward_blocking(self, fwd_id, local_port, remote_host,
+                              remote_port, bind_ip="127.0.0.1"):
         self.opened.append((fwd_id, local_port, remote_host, remote_port))
         listener = self._socket_mod.socket(self._socket_mod.AF_INET,
                                            self._socket_mod.SOCK_STREAM)
@@ -42,14 +52,19 @@ class FakeSession:
         listener.bind(("127.0.0.1", local_port))
         listener.listen(4)
         self._listeners[fwd_id] = listener
-        try:
-            self.events.put_nowait(
-                {"type": "fwd_active", "conn": "fake", "fwd_id": fwd_id})
-        except Exception:
-            pass
+        self._emit_active(fwd_id)
+
+    def open_reverse_forward_blocking(self, fwd_id, remote_host, remote_port,
+                                      local_host, local_port):
+        # 反向：服务器端监听，本地不 bind；只记录并推送 fwd_active
+        self.opened_rev.append((fwd_id, remote_host, remote_port,
+                                local_host, local_port))
+        self._rev_active.add(fwd_id)
+        self._emit_active(fwd_id)
 
     def close_forward_blocking(self, fwd_id):
         self.closed.append(fwd_id)
+        self._rev_active.discard(fwd_id)
         listener = self._listeners.pop(fwd_id, None)
         if listener is not None:
             try:
@@ -62,12 +77,13 @@ class FakeSession:
         self.connected_now = False
         for f in list(self._listeners):
             self.close_forward_blocking(f)
+        self._rev_active.clear()
 
     def traffic(self, fwd_id):
         return (0, 64) if fwd_id in self._listeners else (0, 0)
 
     def running_forwards(self):
-        return set(self._listeners.keys())
+        return set(self._listeners.keys()) | self._rev_active
 
 
 async def main() -> None:

@@ -1,9 +1,10 @@
 """TUI 无头冒烟测试：不依赖真实 SSH，用 app 回调模拟 worker 结果，
 验证布局挂载、连接列表、转发表、状态流转与清理。"""
+import asyncio
 import os
+import queue
 import tempfile
 import uuid
-import asyncio
 
 
 async def main() -> None:
@@ -49,10 +50,11 @@ async def main() -> None:
         app._update_fwd_row(fwd)
         await pilot.pause()
         assert fwd.status == FwdStatus.ACTIVE
-        status_cell = str(table.get_cell_at((0, 4)))
+        # 列序：转发/连接/方向/本地地址/远程目标/状态/连接数/流量
+        status_cell = str(table.get_cell_at((0, 5)))
         assert "已激活" in status_cell, status_cell
-        assert str(table.get_cell_at((0, 5))) == "2"
-        assert "512" in str(table.get_cell_at((0, 6)))
+        assert str(table.get_cell_at((0, 6))) == "2"
+        assert "512" in str(table.get_cell_at((0, 7)))
 
         # 4) 模拟断连事件
         app._handle_event({"type": "disconnected", "conn": "fake",
@@ -170,3 +172,159 @@ if __name__ == "__main__":
 
 def test_ui_smoke():
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# 反向转发：保存链路 + 方向分派 + 表格方向列
+# ---------------------------------------------------------------------------
+class RecordingSession:
+    """记录 open_forward/open_reverse 调用的假会话（验证方向分派）。"""
+
+    def __init__(self, events):
+        self.events = events
+        self.connected_now = True
+        # 非 None 表示 paramiko 客户端已建立（worker 会检查该属性）
+        self.client = object()
+        self.calls: list[tuple] = []
+        self._running: set[str] = set()
+
+    @property
+    def connected(self):
+        return self.connected_now
+
+    def _emit_active(self, fwd_id: str) -> None:
+        try:
+            self.events.put_nowait(
+                {"type": "fwd_active", "conn": "fake", "fwd_id": fwd_id})
+        except queue.Full:
+            pass
+
+    def open_forward_blocking(self, fwd_id, local_port, remote_host,
+                              remote_port, bind_ip="127.0.0.1"):
+        self.calls.append(("fwd", fwd_id, local_port, remote_host, remote_port))
+        self._running.add(fwd_id)
+        self._emit_active(fwd_id)
+
+    def open_reverse_forward_blocking(self, fwd_id, remote_host,
+                                      remote_port, local_host, local_port):
+        self.calls.append(("rev", fwd_id, remote_host, remote_port,
+                           local_host, local_port))
+        self._running.add(fwd_id)
+        self._emit_active(fwd_id)
+
+    def close_forward_blocking(self, fwd_id):
+        self._running.discard(fwd_id)
+
+    def close_blocking(self):
+        self.connected_now = False
+        self._running.clear()
+
+    def traffic(self, fwd_id):
+        return (0, 0)
+
+    def running_forwards(self):
+        return set(self._running)
+
+
+async def _reverse_flow_tui() -> None:
+    tmp = tempfile.mkdtemp(prefix="portfwd-ui-rev-")
+    os.environ["PORTFWD_HOME"] = tmp
+    os.environ["PORTFWD_DISABLE_KEYCHAIN"] = "1"
+
+    from textual.widgets import Button, Input, Select
+
+    from portfwd.app import PortFwdApp
+    from portfwd.config import ConnectionDef
+    from portfwd.models import FwdDirection, FwdStatus, PortForward
+
+    app = PortFwdApp()
+    async with app.run_test(size=(110, 28)) as pilot:
+        await pilot.pause()
+        conn = ConnectionDef(name="fake", host="127.0.0.1")
+        app._config.add(conn)
+        app._selected_conn = "fake"
+        fake = RecordingSession(app._manager.events)
+        app._manager.sessions["fake"] = fake
+
+        # 端口冲突语义：反向规则不占本机监听端口，但同连接内禁止重复远程监听
+        rev0 = PortForward(
+            id=uuid.uuid4().hex[:8], name="proxy0", local_port=7890,
+            remote_host="127.0.0.1", remote_port=17890,
+            direction=FwdDirection.REVERSE, conn="fake")
+        app._forwards[rev0.id] = rev0
+        assert app._local_port_taken(7890) is False, "反向不占本机监听端口"
+        assert app._rev_bind_taken("fake", "127.0.0.1", 17890) is True
+        assert app._rev_bind_taken("other", "127.0.0.1", 17890) is False
+
+        # 新转发屏幕：切换到反向，字段随之变化
+        app.action_fwd_new()
+        await pilot.pause()
+        screen = app.screen
+        assert screen.__class__.__name__ == "ForwardScreen"
+        dir_sel = screen.query_one("#fs-dir", Select)
+        dir_sel.value = "reverse"
+        screen._apply_direction()
+        await pilot.pause()
+        assert screen.query_one("#fs-lhost", Input).display is True, \
+            "反向应显示本机目标地址字段"
+        assert screen.query_one("#fs-local", Input).value == "", \
+            "切到反向后本机目标端口应由用户填写"
+        assert screen.query_one("#fs-rhost", Input).disabled is True, \
+            "反向远程监听地址应锁定 127.0.0.1"
+        assert screen.query_one("#fs-disc", Button).disabled is True, \
+            "反向无需发现远程端口"
+
+        # 重复远程监听 -> 保持屏幕；换端口 -> 保存成功
+        screen.query_one("#fs-name", Input).value = "proxy"
+        screen.query_one("#fs-local", Input).value = "7891"
+        screen.query_one("#fs-rport", Input).value = "17890"
+        screen._save()
+        await pilot.pause()
+        assert app.screen is screen, "重复远程监听端口应被拒绝"
+        screen.query_one("#fs-rport", Input).value = "17891"
+        screen._save()
+        await pilot.pause()
+        assert app.screen is not screen, "保存成功后应关闭屏幕"
+
+        saved = [f for f in app._forwards.values() if f.name == "proxy"]
+        assert saved, "反向规则应已保存"
+        saved = saved[0]
+        assert saved.direction is FwdDirection.REVERSE
+        assert saved.local_host == "127.0.0.1" and saved.local_port == 7891
+        assert saved.remote_host == "127.0.0.1" and saved.remote_port == 17891
+        assert saved.url == "" and saved.can_open_in_browser is False
+        assert any(d.get("id") == saved.id and d.get("direction") == "reverse"
+                   and d.get("local_host") == "127.0.0.1"
+                   for d in conn.port_forwards), "方向应持久化进配置"
+
+        # 连接已启动 -> worker 按 direction 分派到 open_reverse_forward_blocking
+        await pilot.pause(0.8)
+        assert ("rev", saved.id, "127.0.0.1", 17891, "127.0.0.1", 7891) \
+            in fake.calls, fake.calls
+        assert saved.status == FwdStatus.ACTIVE
+
+        # 表格方向列：反向行显示"服务器访问本机"
+        table = app.query_one("#fwd-table")
+        row = list(app._forwards.keys()).index(saved.id)
+        assert str(table.get_cell_at((row, 2))) == "服务器访问本机"
+
+        # 再切回正向：字段恢复
+        app.action_fwd_new()
+        await pilot.pause()
+        f2 = app.screen
+        d2 = f2.query_one("#fs-dir", Select)
+        d2.value = "reverse"
+        f2._apply_direction()
+        d2.value = "forward"
+        f2._apply_direction()
+        await pilot.pause()
+        assert f2.query_one("#fs-lhost", Input).display is False
+        assert f2.query_one("#fs-disc", Button).disabled is False
+        f2.dismiss(None)
+        await pilot.pause()
+
+    print("TUI REVERSE FLOW TEST PASSED ✓")
+
+
+def test_ui_reverse():
+    asyncio.run(_reverse_flow_tui())

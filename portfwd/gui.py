@@ -21,9 +21,9 @@ from typing import Any, Optional
 
 import flet as ft
 
-from .config import CONFIG_FILE, ConnectionDef, Config
-from .forwarding import ConnectionAuthError, SessionManager
-from .models import FwdStatus, PortForward, STATUS_LABEL, human_bytes
+from .config import CONFIG_FILE, Config, ConnectionDef
+from .forwarding import ConnectionAuthError, SessionManager, open_forward_for_session
+from .models import STATUS_LABEL, FwdDirection, FwdStatus, PortForward, human_bytes
 
 log = logging.getLogger("portfwd")
 
@@ -164,10 +164,13 @@ class PortFwdGui:
             controls=[], spacing=4, item_extent=64, expand=True,
             padding=ft.Padding(left=8, top=4, right=8, bottom=8),
         )
+        # 本地地址：正向=本机监听端，反向=本机目标端；
+        # 远程目标：正向=远程目标，反向=远程监听端（方向列消歧）
         self._fwd_table = ft.DataTable(
             columns=[
                 ft.DataColumn(label=h)
-                for h in ("转发", "连接", "本地地址", "远程目标", "状态", "连接数", "流量", "操作")
+                for h in ("转发", "连接", "方向", "本地地址", "远程目标",
+                          "状态", "连接数", "流量", "操作")
             ],
             column_spacing=28,
             border=ft.Border(
@@ -333,7 +336,8 @@ class PortFwdGui:
                 on_click=lambda _e, i=fwd.id: self._fwd_toggle(i),
             ),
         ]
-        if fwd.status == FwdStatus.ACTIVE:
+        # 反向规则没有可打开的本机地址，不显示"浏览器打开"按钮
+        if fwd.status == FwdStatus.ACTIVE and fwd.can_open_in_browser:
             btns.append(
                 ft.IconButton(ft.Icons.OPEN_IN_NEW, icon_size=18, tooltip="浏览器打开",
                               on_click=lambda _e, i=fwd.id: self._fwd_open(i))
@@ -376,6 +380,7 @@ class PortFwdGui:
                 cells=[
                     ft.DataCell(content=ft.Text(fwd.name, size=13)),
                     ft.DataCell(content=ft.Text(fwd.conn, size=13)),
+                    ft.DataCell(content=ft.Text(fwd.direction_label, size=13)),
                     ft.DataCell(content=ft.Text(fwd.address, size=13,
                                                 font_family="monospace")),
                     ft.DataCell(content=ft.Text(fwd.display_remote, size=13,
@@ -595,9 +600,7 @@ class PortFwdGui:
                 client = None
             if client is None:
                 session.connect_blocking(conn.password or None)
-            session.open_forward_blocking(
-                fwd_id, fwd.local_port, fwd.remote_host, fwd.remote_port
-            )
+            open_forward_for_session(session, fwd)
         except ConnectionAuthError as e:
             self._ui(self._auth_failed, conn_name, str(e))
             self._ui(self._fwd_error, fwd_id, str(e))
@@ -898,18 +901,72 @@ class PortFwdGui:
     def _show_fwd_dialog(self, conn_name: str) -> None:
         page = self._page
         assert page is not None
+        init_local = self._next_local_port()
         f_name = ft.TextField(label="转发名称", hint_text="如 web-ui")
+        f_dir = ft.Dropdown(
+            label="方向",
+            options=[
+                ft.DropdownOption(key="forward",
+                                  text="访问服务器端口（本机 → 服务器）"),
+                ft.DropdownOption(key="reverse",
+                                  text="服务器访问本机（服务器 → 本机）"),
+            ],
+            value="forward",
+        )
         f_local = ft.TextField(label="本地端口", expand=True, input_filter=NUM,
-                               value=str(self._next_local_port()),
+                               value=str(init_local),
                                hint_text="在本机 127.0.0.1 监听")
+        f_lhost = ft.TextField(label="本机目标地址", expand=True,
+                               value="127.0.0.1",
+                               hint_text="本机上的服务地址", visible=False)
         f_rport = ft.TextField(label="远程端口", expand=True, input_filter=NUM,
                                value="80")
         f_rhost = ft.TextField(label="远程主机", value="127.0.0.1",
                                hint_text="127.0.0.1 = SSH 会话所在主机")
         dd = ft.Dropdown(expand=True, options=[],
                          hint_text="远程监听端口（先点「发现」）")
+        btn_disc = ft.OutlinedButton("发现远程端口", icon=ft.Icons.SEARCH)
         hint = ft.Text("选中条目自动填入上方远程主机/端口", size=12,
                        color=ft.Colors.GREY)
+
+        def apply_dir(_e: Any = None) -> None:
+            """方向切换：字段标签/默认值/可见性随之变化（正向与旧版一致）。"""
+            rev = (f_dir.value or "forward") == "reverse"
+            f_lhost.visible = rev
+            if rev:
+                if f_local.value == str(init_local):
+                    f_local.value = ""
+                f_local.label = "本机目标端口"
+                f_local.hint_text = "本机上的服务，如代理 7890"
+                f_rhost.label = "远程监听地址"
+                f_rhost.value = "127.0.0.1"
+                f_rhost.hint_text = "仅支持 127.0.0.1（不暴露 0.0.0.0）"
+                f_rhost.disabled = True
+                if f_rport.value in ("80", ""):
+                    f_rport.value = str(self._next_remote_port(conn_name))
+                f_rport.label = "远程监听端口"
+                dd.visible = False
+                btn_disc.disabled = True
+                hint.value = "反向转发无需发现端口：远程监听 127.0.0.1:端口 → 本机目标"
+            else:
+                if not f_local.value:
+                    f_local.value = str(init_local)
+                f_local.label = "本地端口"
+                f_local.hint_text = "在本机 127.0.0.1 监听"
+                f_rhost.label = "远程主机"
+                f_rhost.value = "127.0.0.1"
+                f_rhost.hint_text = "127.0.0.1 = SSH 会话所在主机"
+                f_rhost.disabled = False
+                f_rport.label = "远程端口"
+                f_rport.hint_text = ""
+                dd.visible = True
+                btn_disc.disabled = False
+                hint.value = "选中条目自动填入上方远程主机/端口"
+            for c in (f_lhost, f_local, f_rhost, f_rport, dd, btn_disc):
+                c.update()
+            hint.update()
+
+        f_dir.on_change = apply_dir
 
         def do_discover(_e: Any) -> None:
             self._notify_sync("正在读取远程监听端口…")
@@ -925,22 +982,39 @@ class PortFwdGui:
                 f_rport.update()
 
         dd.on_select = do_pick
+        btn_disc.on_click = do_discover
 
         def do_save(_e: Any) -> None:
             name = f_name.value.strip() or "portfwd"
+            direction = FwdDirection(f_dir.value or "forward")
             local, _ = parse_port(f_local.value)
             if local is None:
-                self._notify_sync("本地端口无效", ft.Colors.RED)
+                self._notify_sync(
+                    "本机目标端口无效" if direction is FwdDirection.REVERSE
+                    else "本地端口无效", ft.Colors.RED)
                 return
-            rhost = f_rhost.value.strip() or "127.0.0.1"
             remote, _ = parse_port(f_rport.value)
             if remote is None:
-                self._notify_sync("远程端口无效", ft.Colors.RED)
+                self._notify_sync(
+                    "远程监听端口无效" if direction is FwdDirection.REVERSE
+                    else "远程端口无效", ft.Colors.RED)
                 return
-            if self._local_port_taken(local):
-                self._notify_sync(f"本地端口 {local} 已被其它转发占用", ft.Colors.RED)
-                return
-            self._add_forward(conn_name, name, local, rhost, remote)
+            if direction is FwdDirection.REVERSE:
+                lhost = (f_lhost.value or "127.0.0.1").strip() or "127.0.0.1"
+                rhost = "127.0.0.1"
+                if self._rev_bind_taken(conn_name, rhost, remote):
+                    self._notify_sync(
+                        f"远程监听 127.0.0.1:{remote} 已被同一连接的反向转发占用",
+                        ft.Colors.RED)
+                    return
+            else:
+                lhost = "127.0.0.1"
+                rhost = f_rhost.value.strip() or "127.0.0.1"
+                if self._local_port_taken(local):
+                    self._notify_sync(f"本地端口 {local} 已被其它转发占用",
+                                      ft.Colors.RED)
+                    return
+            self._add_forward(conn_name, name, direction, lhost, local, rhost, remote)
             page.pop_dialog()
 
         dlg = ft.AlertDialog(
@@ -950,14 +1024,12 @@ class PortFwdGui:
                 content=ft.Column(
                     controls=[
                         f_name,
+                        f_dir,
                         ft.Row(controls=[f_local, f_rport], spacing=12),
+                        f_lhost,
                         f_rhost,
                         ft.Row(
-                            controls=[
-                                ft.OutlinedButton("发现远程端口", icon=ft.Icons.SEARCH,
-                                                  on_click=do_discover),
-                                hint,
-                            ],
+                            controls=[btn_disc, hint],
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             spacing=12,
                         ),
@@ -974,7 +1046,8 @@ class PortFwdGui:
         )
         page.show_dialog(dlg)
 
-    def _add_forward(self, conn_name: str, name: str, local_port: int,
+    def _add_forward(self, conn_name: str, name: str, direction: FwdDirection,
+                     local_host: str, local_port: int,
                      remote_host: str, remote_port: int) -> None:
         conn = self._config.find(conn_name)
         if conn is None:
@@ -984,6 +1057,7 @@ class PortFwdGui:
             id=uuid.uuid4().hex[:8],
             name=name, local_port=local_port,
             remote_host=remote_host, remote_port=remote_port,
+            direction=direction, local_host=local_host,
             conn=conn.name,
         )
         self._forwards[fwd.id] = fwd
@@ -1010,7 +1084,7 @@ class PortFwdGui:
         fwd = self._forwards.get(fwd_id)
         if fwd is None:
             return
-        self._confirm(f"删除转发 {fwd.name}（{fwd.address} → {fwd.display_remote}）？",
+        self._confirm(f"删除转发 {fwd.name}（{fwd.link}）？",
                       lambda: self._do_delete_fwd(fwd_id))
 
     def _do_delete_fwd(self, fwd_id: str) -> None:
@@ -1031,7 +1105,8 @@ class PortFwdGui:
 
     def _fwd_open(self, fwd_id: str) -> None:
         fwd = self._forwards.get(fwd_id)
-        if fwd is None or self._page is None:
+        # 反向规则没有可打开的本机地址
+        if fwd is None or not fwd.can_open_in_browser or self._page is None:
             return
         try:
             self._page.run_task(self._page.url_launcher.launch_url, fwd.url)
@@ -1064,11 +1139,38 @@ class PortFwdGui:
         return bool(session is not None and session.connected)
 
     def _local_port_taken(self, port: int) -> bool:
-        return any(f.local_port == port for f in self._forwards.values())
+        # 只有正向规则在本机起监听，反向的 local 端是目标不占端口
+        return any(
+            f.local_port == port and f.direction is FwdDirection.FORWARD
+            for f in self._forwards.values()
+        )
+
+    def _rev_bind_taken(self, conn_name: str, host: str, port: int) -> bool:
+        # 反向：同一 SSH 连接内不允许重复的远程监听 host:port
+        return any(
+            f.direction is FwdDirection.REVERSE
+            and f.conn == conn_name
+            and f.remote_host == host
+            and f.remote_port == port
+            for f in self._forwards.values()
+        )
 
     def _next_local_port(self) -> int:
-        taken = {f.local_port for f in self._forwards.values()}
+        taken = {
+            f.local_port for f in self._forwards.values()
+            if f.direction is FwdDirection.FORWARD
+        }
         port = 8080
+        while port in taken:
+            port += 1
+        return port
+
+    def _next_remote_port(self, conn_name: str) -> int:
+        taken = {
+            f.remote_port for f in self._forwards.values()
+            if f.direction is FwdDirection.REVERSE and f.conn == conn_name
+        }
+        port = 18080
         while port in taken:
             port += 1
         return port

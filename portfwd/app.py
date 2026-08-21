@@ -21,6 +21,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -29,23 +30,26 @@ from textual.widgets import (
     Header,
     Input,
     Label,
-    ListView,
     ListItem,
+    ListView,
     OptionList,
     Select,
 )
 from textual.widgets.option_list import Option
 
-from .config import CONFIG_FILE, ConnectionDef, Config
-from .forwarding import ConnectionAuthError, SessionManager
-from .models import FwdStatus, PortForward, STATUS_LABEL, human_bytes
+from .config import CONFIG_FILE, Config, ConnectionDef
+from .forwarding import ConnectionAuthError, SessionManager, open_forward_for_session
+from .models import STATUS_LABEL, FwdDirection, FwdStatus, PortForward, human_bytes
 
 log = logging.getLogger("portfwd")
 
-# 表格列定义：(key, 表头, 宽度)
+# 表格列定义：(key, 表头, 宽度)。
+# 注意："本地地址"在正向是本机监听端，反向是本机目标端；
+# "远程目标"在正向是远程目标，反向是远程监听端（方向列消歧）。
 COLUMNS: list[tuple[str, str, int]] = [
     ("name", "转发", 18),
     ("conn", "连接", 12),
+    ("direction", "方向", 17),
     ("local", "本地地址", 15),
     ("remote", "远程目标", 18),
     ("status", "状态", 32),
@@ -180,7 +184,15 @@ class ConnectScreen(ModalScreen[Optional[ConnectionDef]]):
 # 模态屏：新建转发
 # ---------------------------------------------------------------------------
 class ForwardScreen(ModalScreen[Optional[dict[str, Any]]]):
-    """给选中连接新建一条转发；可一键发现远程监听端口并填入。"""
+    """给选中连接新建一条转发。
+
+    方向切换：
+      - 访问服务器端口（正向，默认）：本机 127.0.0.1:本地端口 监听
+        -> SSH -> 远程目标；可一键发现远程监听端口并填入。
+      - 服务器访问本机（反向）：远程 127.0.0.1:远程监听端口 -> SSH
+        -> 本机目标 host:port（如本机代理）；不暴露 0.0.0.0，
+        也不需要发现远程端口。
+    """
 
     CSS = """
     #fs-panel {
@@ -191,8 +203,9 @@ class ForwardScreen(ModalScreen[Optional[dict[str, Any]]]):
         background: $surface;
         padding: 1 2;
     }
-    #fs-panel > Input { margin: 0 0 1 0; }
+    #fs-panel > Input, #fs-panel > Select { margin: 0 0 1 0; }
     #fs-title { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #fs-dir { width: 1fr; }
     #fs-rhost { width: 1fr; }
     #fs-rport { width: 8; }
     #fs-hint { color: $text-muted; }
@@ -210,19 +223,35 @@ class ForwardScreen(ModalScreen[Optional[dict[str, Any]]]):
         with Vertical(id="fs-panel"):
             yield Label(f"新建转发 · 连接：{self._conn_name}", id="fs-title")
             yield Input(select_on_focus=False, placeholder="转发名称（如 web-ui）", id="fs-name")
-            yield Input(select_on_focus=False, 
+            yield Select(
+                [
+                    ("访问服务器端口（本机 → 服务器）", "forward"),
+                    ("服务器访问本机（服务器 → 本机）", "reverse"),
+                ],
+                value="forward",
+                prompt="方向",
+                id="fs-dir",
+            )
+            yield Input(select_on_focus=False,
                 value=str(self._local_port),
                 placeholder="本地端口（在本机 127.0.0.1 监听）",
                 id="fs-local",
                 restrict=r"[0-9]*",
             )
+            lhost_input = Input(select_on_focus=False,
+                value="127.0.0.1",
+                placeholder="本机目标地址（本机上的服务地址）",
+                id="fs-lhost",
+            )
+            lhost_input.display = False
+            yield lhost_input
             with Horizontal():
-                yield Input(select_on_focus=False, 
+                yield Input(select_on_focus=False,
                     value="127.0.0.1",
                     placeholder="远程主机（127.0.0.1 = SSH 会话所在主机）",
                     id="fs-rhost",
                 )
-                yield Input(select_on_focus=False, 
+                yield Input(select_on_focus=False,
                     value="80",
                     placeholder="远程端口",
                     id="fs-rport",
@@ -238,7 +267,57 @@ class ForwardScreen(ModalScreen[Optional[dict[str, Any]]]):
                 yield Button("保存并启动", variant="primary", id="fs-save")
 
     def on_mount(self) -> None:
+        self._apply_direction()
         self.query_one("#fs-name", Input).focus()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "fs-dir":
+            self._apply_direction()
+
+    def _direction(self) -> FwdDirection:
+        try:
+            value = self.query_one("#fs-dir", Select).value
+        except NoMatches:
+            return FwdDirection.FORWARD
+        try:
+            return FwdDirection(str(value or "forward"))
+        except ValueError:
+            return FwdDirection.FORWARD
+
+    def _apply_direction(self) -> None:
+        """按当前方向切换字段标签/默认值/可见性（正向与旧版行为一致）。"""
+        rev = self._direction() is FwdDirection.REVERSE
+        lhost = self.query_one("#fs-lhost", Input)
+        lhost.display = rev
+        local = self.query_one("#fs-local", Input)
+        rhost = self.query_one("#fs-rhost", Input)
+        rport = self.query_one("#fs-rport", Input)
+        if rev:
+            # 切到反向：本机端改成"目标端口"（清空初始建议值），
+            # 远程端固定 127.0.0.1 监听，远程端口给一个不冲突的建议值
+            if local.value == str(self._local_port):
+                local.value = ""
+            local.placeholder = "本机目标端口（本机上的服务，如代理 7890）"
+            rhost.value = "127.0.0.1"
+            rhost.placeholder = "远程监听地址（仅支持 127.0.0.1）"
+            rhost.disabled = True
+            if rport.value in ("80", ""):
+                rport.value = str(self.app._next_remote_port(self._conn_name))
+            rport.placeholder = "远程监听端口"
+        else:
+            if not local.value:
+                local.value = str(self._local_port)
+            local.placeholder = "本地端口（在本机 127.0.0.1 监听）"
+            rhost.value = "127.0.0.1"
+            rhost.placeholder = "远程主机（127.0.0.1 = SSH 会话所在主机）"
+            rhost.disabled = False
+            rport.placeholder = "远程端口"
+        self.query_one("#fs-disc", Button).disabled = rev
+        self.query_one("#fs-ports", OptionList).display = not rev
+        self.query_one("#fs-hint", Label).update(
+            "（反向转发无需发现端口：远程监听 127.0.0.1:端口 → 本机目标）"
+            if rev else "（需该连接已启动；选中条目自动填入上方）"
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "fs-cancel":
@@ -259,21 +338,41 @@ class ForwardScreen(ModalScreen[Optional[dict[str, Any]]]):
     def _save(self) -> None:
         app = self.app
         name = self.query_one("#fs-name", Input).value.strip() or "portfwd"
+        direction = self._direction()
         local = self.query_one("#fs-local", Input).value.strip()
-        remote_host = self.query_one("#fs-rhost", Input).value.strip() or "127.0.0.1"
         remote_port = self.query_one("#fs-rport", Input).value.strip()
-        if not (local.isdigit() and 1 <= int(local) <= 65535):
-            app.notify("本地端口无效", severity="error")
-            return
-        if not (remote_port.isdigit() and 1 <= int(remote_port) <= 65535):
-            app.notify("远程端口无效", severity="error")
-            return
-        if app._local_port_taken(int(local)):
-            app.notify(f"本地端口 {local} 已被其它转发占用", severity="error")
-            return
+        if direction is FwdDirection.REVERSE:
+            local_host = self.query_one("#fs-lhost", Input).value.strip() or "127.0.0.1"
+            remote_host = "127.0.0.1"
+            if not (local.isdigit() and 1 <= int(local) <= 65535):
+                app.notify("本机目标端口无效", severity="error")
+                return
+            if not (remote_port.isdigit() and 1 <= int(remote_port) <= 65535):
+                app.notify("远程监听端口无效", severity="error")
+                return
+            if app._rev_bind_taken(self._conn_name, remote_host, int(remote_port)):
+                app.notify(
+                    f"远程监听 127.0.0.1:{remote_port} 已被同一连接的反向转发占用",
+                    severity="error",
+                )
+                return
+        else:
+            local_host = "127.0.0.1"
+            remote_host = self.query_one("#fs-rhost", Input).value.strip() or "127.0.0.1"
+            if not (local.isdigit() and 1 <= int(local) <= 65535):
+                app.notify("本地端口无效", severity="error")
+                return
+            if not (remote_port.isdigit() and 1 <= int(remote_port) <= 65535):
+                app.notify("远程端口无效", severity="error")
+                return
+            if app._local_port_taken(int(local)):
+                app.notify(f"本地端口 {local} 已被其它转发占用", severity="error")
+                return
         self.dismiss(
             {
                 "name": name,
+                "direction": direction.value,
+                "local_host": local_host,
                 "local_port": int(local),
                 "remote_host": remote_host,
                 "remote_port": int(remote_port),
@@ -476,6 +575,7 @@ class PortFwdApp(App):
             dt.add_row(
                 fwd.name,
                 fwd.conn,
+                fwd.direction_label,
                 fwd.address,
                 fwd.display_remote,
                 self._status_cell(fwd),
@@ -671,9 +771,7 @@ class PortFwdApp(App):
                 client = None
             if client is None:
                 session.connect_blocking(conn.password or None)
-            session.open_forward_blocking(
-                fwd_id, fwd.local_port, fwd.remote_host, fwd.remote_port
-            )
+            open_forward_for_session(session, fwd)
         except ConnectionAuthError as e:
             self._ui(self._auth_failed, conn_name, str(e))
             self._ui(self._fwd_error, fwd_id, str(e))
@@ -910,6 +1008,8 @@ class PortFwdApp(App):
             local_port=data["local_port"],
             remote_host=data["remote_host"],
             remote_port=data["remote_port"],
+            direction=data.get("direction", FwdDirection.FORWARD.value),
+            local_host=data.get("local_host", "127.0.0.1"),
             conn=conn.name,
         )
         self._forwards[fwd.id] = fwd
@@ -964,11 +1064,38 @@ class PortFwdApp(App):
         return bool(session is not None and session.connected)
 
     def _local_port_taken(self, port: int) -> bool:
-        return any(f.local_port == port for f in self._forwards.values())
+        # 只有正向规则在本机起监听，反向的 local 端是目标不占端口
+        return any(
+            f.local_port == port and f.direction is FwdDirection.FORWARD
+            for f in self._forwards.values()
+        )
+
+    def _rev_bind_taken(self, conn_name: str, host: str, port: int) -> bool:
+        # 反向：同一 SSH 连接内不允许重复的远程监听 host:port
+        return any(
+            f.direction is FwdDirection.REVERSE
+            and f.conn == conn_name
+            and f.remote_host == host
+            and f.remote_port == port
+            for f in self._forwards.values()
+        )
 
     def _next_local_port(self) -> int:
-        taken = {f.local_port for f in self._forwards.values()}
+        taken = {
+            f.local_port for f in self._forwards.values()
+            if f.direction is FwdDirection.FORWARD
+        }
         port = 8080
+        while port in taken:
+            port += 1
+        return port
+
+    def _next_remote_port(self, conn_name: str) -> int:
+        taken = {
+            f.remote_port for f in self._forwards.values()
+            if f.direction is FwdDirection.REVERSE and f.conn == conn_name
+        }
+        port = 18080
         while port in taken:
             port += 1
         return port
